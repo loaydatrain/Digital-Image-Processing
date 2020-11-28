@@ -1,0 +1,1 @@
+pip install numpy matplotlib opencv-contrib-python opencv-python webcolors scikit-image scipy

@@ -1,0 +1,304 @@
+# from scipy.misc import imread
+from skimage.color import rgb2gray
+import matplotlib.pyplot as plt
+import webcolors
+from mpl_toolkits.mplot3d import Axes3D
+import scipy.ndimage.filters as filters
+from skimage.draw import polygon, polygon_perimeter
+from skimage import measure
+import cv2
+# import drlse_algo as drlse
+import numpy as np
+
+drawing = False # true if mouse is pressed
+mode = True # if True, draw rectangle. Press 'm' to toggle to curve
+current_former_x,current_former_y = -1,-1
+ix, iy = -1, -1
+image = 0
+r = 0
+g = 0
+b = 0
+
+def nothing(x):
+    pass
+
+# mouse callback function
+def paint_draw(event,former_x,former_y,flags,param):
+    global current_former_x,current_former_y,drawing, mode, r, g, b
+
+    if event==cv2.EVENT_LBUTTONDOWN:
+        drawing=True
+        current_former_x,current_former_y=former_x,former_y
+
+    elif event==cv2.EVENT_MOUSEMOVE:
+        if drawing==True:
+            if mode==True:
+                cv2.line(image,(current_former_x,current_former_y),(former_x,former_y),(b,g,r),5)
+                current_former_x = former_x
+                current_former_y = former_y
+    elif event==cv2.EVENT_LBUTTONUP:
+        drawing=False
+        if mode==True:
+            cv2.line(image,(current_former_x,current_former_y),(former_x,former_y),(b,g,r),5)
+            current_former_x = former_x
+            current_former_y = former_y
+    return former_x,former_y
+
+class drlse(object):
+
+	def __init__(self, F, lamda, mu, alpha, epsilon, dt, iterations, potential_function, M1, M2, F1):
+		self.F = F
+		self.lamda = lamda
+		self.alpha = alpha
+		self.epsilon = epsilon
+		self.dt = dt
+		self.mu = mu
+		self.iter = iterations
+		self.potential_function = potential_function
+		self.M1 = M1
+		self.M2 = M2
+		self.F1 = F1
+
+	#SIGMOID FOR LEAKPROOF
+	def sigmoid(self, x):
+		return np.exp(x)/(1+ np.exp(x))
+
+	#PARTIAL DIFFERENTIAL EQUATION
+	def drlse_edge(self,phi):
+		[vy, vx] = np.gradient(self.F)
+		for k in range(self.iter):
+		    phi = self.applyNeumann(phi)
+		    [phi_y, phi_x] = np.gradient(phi)
+		    s = np.sqrt(np.square(phi_x) + np.square(phi_y))
+		    smallNumber = 1e-10
+		    Nx = phi_x / (s + smallNumber)
+		    Ny = phi_y / (s + smallNumber)
+		    curvature = self.div(Nx, Ny)
+		    if self.potential_function == 'single-well':
+		        distRegTerm = filters.laplace(phi, mode='wrap') - curvature
+		    elif self.potential_function == 'double-well':
+		        distRegTerm = self.distReg_p2(phi)
+		    else:
+		        print('Error: Wrong choice of potential function. Please input the string "single-well" or "double-well" in the drlse_edge function.')
+		    diracPhi = self.Dirac(phi)
+		    areaTerm = diracPhi * self.F
+		    edgeTerm = diracPhi * (vx * Nx + vy * Ny) + diracPhi * self.F * curvature
+		    x = (self.F1 - self.M2)/(self.M1 - self.M2)
+		    leakproofterm = self.F*areaTerm*self.sigmoid(x)
+		    y =  self.dt * (self.mu * distRegTerm + self.lamda * edgeTerm + self.alpha * areaTerm - leakproofterm*self.alpha)
+		    #print(np.unique(y))
+		    phi = phi + self.dt * (self.mu * distRegTerm + self.lamda * edgeTerm + self.alpha * areaTerm - leakproofterm*self.alpha)
+
+		return phi
+
+	#ONE WELL OR TWO WELL
+	def distReg_p2(self,phi):
+	    [phi_y, phi_x] = np.gradient(phi)
+	    s = np.sqrt(np.square(phi_x) + np.square(phi_y))
+	    a = (s >= 0) & (s <= 1)
+	    b = (s > 1)
+	    ps = a * np.sin(2 * np.pi * s) / (2 * np.pi) + b * (s - 1)
+	    dps = ((ps != 0) * ps + (ps == 0)) / ((s != 0) * s + (s == 0))
+	    return self.div(dps * phi_x - phi_x, dps * phi_y - phi_y) + filters.laplace(phi, mode='wrap')
+
+	
+	def div(self,nx, ny):
+	    [junk, nxx] = np.gradient(nx)
+	    [nyy, junk] = np.gradient(ny)
+	    # [junk, nxx, nzz] = np.gradient(nx)
+	    # [nyy, junk, nzz] = np.gradient(ny)
+	    return nxx + nyy
+
+	#DIRAC DELTA
+	def Dirac(self,x):
+	    f = (1 / 2 / self.epsilon) * (1 + np.cos(np.pi * x / self.epsilon))
+	    b = (x <= self.epsilon) & (x >= -self.epsilon)
+	    return f * b
+
+	#NEUMANN BOUNDARY
+	def applyNeumann(self,f):
+	    [ny, nx] = f.shape
+	    # [ny, nx, nz] = f.shape
+	    g = f.copy()
+	    g[0, 0] = g[2, 2]
+	    g[0, nx-1] = g[2, nx-3]
+	    g[ny-1, 0] = g[ny-3, 2]
+	    g[ny-1, nx-1] = g[ny-3, nx-3]
+
+	    g[0, 1:-1] = g[2, 1:-1]
+	    g[ny-1, 1:-1] = g[ny-3, 1:-1]
+
+	    g[1:-1, 0] = g[1:-1, 2]
+	    g[1:-1, nx-1] = g[1:-1, nx-3]
+	    return g
+
+
+
+class levelSet(object):
+
+	def __init__(self, drlse_iter, gradient_iter, lamda, alpha, epsilon, sigma, dt=1, potential_function="double-well"):
+		self.lamda = lamda
+		self.alpha = alpha
+		self.epsilon = epsilon
+		self.sigma = sigma
+		self.dt = dt
+		self.mu = 0.2/self.dt
+		self.drlse_iter = drlse_iter
+		self.gradient_iter = gradient_iter
+		self.potential_function = potential_function
+
+	#INIT PHI
+	def initializePhiAtScribble(self,image,x,y):
+		c0 = 4
+		phi = c0 * np.ones(image.shape)
+		phi[x-5:x+5, y-3:y+3] = -c0
+		return phi
+
+	def visualization(self,image,phi):
+		contours = measure.find_contours(phi, 0)
+		temp = np.zeros(image.shape[0:2])
+		temp[phi < 0] = 255
+		fig2 = plt.figure(2)
+		fig2.clf()
+		ax2 = fig2.add_subplot(121)
+		ax2.imshow(image,cmap=plt.cm.gray)
+		for n, contour in enumerate(contours):
+# 			print(n)
+			ax2.plot(contour[:, 1], contour[:, 0], linewidth=2)
+		return contour,temp
+
+	#CALCULATE FILTER/HALTING
+	def calculateF(self,image):
+		img_smooth = filters.gaussian_filter(image, self.sigma)
+		[Iy, Ix] = np.gradient(img_smooth)
+		f = np.square(Ix) + np.square(Iy)
+		f1 = np.sqrt(f)
+		self.FI = 1 / (1+f)
+		#print(np.unique(f))
+		return 1 / (1+f), np.max(f1), np.min(f1), f1
+	#STROKEPRESEVING IMPLEMENTATION
+	def strokepreserving(self, image, rgb):
+		img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+		color = np.array(rgb)
+		colored_img = np.ones((self.phi.shape[0],self.phi.shape[1],3), dtype=np.uint8)
+		colored_img[self.phi<0] = color
+		# plt.imshow(colored_img)
+		# plt.pause(0.2)
+
+		yuv_img = cv2.cvtColor(colored_img, cv2.COLOR_BGR2YUV)
+		# plt.imshow( LS.FI[60:100] )
+		# plt.pause(0.2)
+		plt.imshow(( (1-self.FI)**2 ))
+		plt.pause(0.2)
+		print(np.unique(self.FI,return_counts=True))
+		y=0
+		yuv_img[:,:,y] = yuv_img[:,:,y] * ( (1-self.FI)**2 )
+
+		colored_img = cv2.cvtColor(yuv_img, cv2.COLOR_YUV2BGR)
+		# cv2.imshow('coloured',colored_img)
+		# cv2.waitKey(0)
+		# cv2.destroyAllWindows()
+		colored_img[:,:,0] *= np.array(img/10,dtype=np.uint8)
+		colored_img[:,:,1] *= np.array(img/10,dtype=np.uint8)
+		colored_img[:,:,2] *= np.array(img/10,dtype=np.uint8)
+		plt.imshow(colored_img)
+		plt.pause(0.2)
+		res = np.ones((self.phi.shape[0],self.phi.shape[1],3), dtype=np.uint8)
+		res[self.phi>0] = colored_img[self.phi>0] + image[self.phi>0]
+		res[self.phi<0] = colored_img[self.phi<0]
+		cv2.imwrite("res_shading_4.png", res)
+		plt.imshow(colored_img)
+		plt.pause(0.2)
+	#FLOOD FILL FORT INTENSITY CONTINUOUS
+	def fillColor(self,image, boundary,rgb):
+		# boundary[:,[0,1]] = boundary[:,[1,0]]
+# 		print(boundary)
+		temp = np.zeros(image.shape)
+# 		temp[boundary,0] = 255
+# 		temp[boundary,1] = 255
+# 		temp[boundary,2] = 255
+# 		plt.show()
+		#b = np.repeat(F[:, :, np.newaxis], 3, axis=2)
+		img = image.copy()
+		rr, cc = polygon(boundary[:,0], boundary[:,1], image.shape)
+		image[rr,cc,:] = rgb#*image[rr,cc,:]
+		rr, cc = polygon_perimeter(boundary[:,0], boundary[:,1], image.shape)
+		temp[rr,cc,0] = 255
+		temp[rr,cc,1] = 255
+		temp[rr,cc,2] = 255
+		cv2.imshow('',temp)
+		image[rr,cc,:] = rgb
+		return image
+
+	def gradientDescent(self,image,x,y):
+		self.phi = self.initializePhiAtScribble(image,x,y)
+		F, M1, M2, F1 = self.calculateF(image)
+		lse = drlse(F, self.lamda, self.mu, self.alpha, self.epsilon, self.dt, self.drlse_iter, self.potential_function, M1, M2, F1)
+		try:
+			for n in range(self.gradient_iter):
+				self.phi = lse.drlse_edge(self.phi)
+				if np.mod(n, 2) == 0:
+					boundary,out1 = self.visualization(image.copy(),self.phi)
+					plt.pause(1)
+		except KeyboardInterrupt:
+			pass
+		return np.int32(boundary), F,out1
+		# plt.pause(5)
+def RGB2YUV( rgb ):
+
+    m = np.array([[ 0.29900, 0.587,  0.114],
+                 [-0.14713, -0.28886, 0.436],
+                 [ 0.615, -0.51499, -0.10001]])
+
+    yuv = np.dot(m,rgb)
+    print(yuv.shape, rgb.shape)
+    return yuv
+
+
+def main(filename):
+	global current_former_x,current_former_y,drawing, mode, r, g, b, image
+
+	# iter_inner, iter_outer, lamda, alpha, epsilon, sigma, dt, potential_function
+	# potential_function="single-well"
+
+	image = cv2.imread(filename,True)
+	image1 = image.copy()
+	# plt.imshow(image)
+	# plt.show()
+	# print(image.shape)
+	cv2.namedWindow('image', cv2.WINDOW_NORMAL)
+	#cv2.namedWindow('trackbar')
+	#cv2.resizeWindow('trackbar', (10,10))
+	cv2.setMouseCallback('image', paint_draw)
+	cv2.createTrackbar('R','image',0,255, nothing)
+	cv2.createTrackbar('G','image',0,255, nothing)
+	cv2.createTrackbar('B','image',0,255, nothing)
+	while(1):
+		cv2.imshow('image',image)
+		if cv2.waitKey(20) & 0xFF == 27:
+			break
+		r = cv2.getTrackbarPos('R','image')
+		g = cv2.getTrackbarPos('G','image')
+		b = cv2.getTrackbarPos('B','image')
+	cv2.destroyAllWindows()
+
+	#image1 = np.array(image1,dtype='float32')
+	LS = levelSet(4,50,2,-9,2.0,0.8)
+	print(current_former_x, current_former_y)
+	boundary, F= LS.gradientDescent(image1[:,:,0],current_former_y,current_former_x)
+	#print(boundary)
+	# img_yuv = cv2.cvtColor(image1, cv2.COLOR_BGR2YUV)
+	# yuv = RGB2YUV(np.asarray([r,g,b]).reshape((3,1)))
+	# print(yuv, F.shape)
+	# #F= LS.calculateF(img_yuv)
+	# xyz = cv2.filter2D(np.square(1-F),-1,yuv[0])
+	# img_yuv[:,:,0] = xyz
+	# cv2.imshow("sdjkfnskj",cv2.cvtColor(img_yuv, cv2.COLOR_LUV2RGB))
+	# cv2.waitKey(0)
+	LS.strokepreserving(image1, (b,g,r))
+	cv2.imwrite("res.png",LS.fillColor(image1, boundary,(b,g,r)))
+
+
+if __name__ == '__main__':
+	filename = input()
+	main(filename)
